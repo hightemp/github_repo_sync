@@ -1,0 +1,4 @@
+github_token: your-github-token-here
+github_user: username
+repos_dir: ./repositories
+poll_interval: 5m
