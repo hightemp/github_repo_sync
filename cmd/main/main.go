@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-git/go-git/v5"
@@ -16,10 +19,25 @@ import (
 )
 
 type Config struct {
-	GithubToken  string `yaml:"github_token"`
-	GithubUser   string `yaml:"github_user"`
-	ReposDir     string `yaml:"repos_dir"`
-	PollInterval string `yaml:"poll_interval"`
+	GithubToken   string `yaml:"github_token"`
+	GithubUser    string `yaml:"github_user"`
+	ReposDir      string `yaml:"repos_dir"`
+	PollInterval  string `yaml:"poll_interval"`
+	WorkerCount   int    `yaml:"worker_count"`
+	WorkQueueSize int    `yaml:"queue_size"`
+}
+
+type RepoTask struct {
+	Repo     *github.Repository
+	RepoPath string
+}
+
+type Worker struct {
+	id          int
+	client      *github.Client
+	tasksChan   chan RepoTask
+	wg          *sync.WaitGroup
+	rateLimiter *time.Ticker
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -28,7 +46,10 @@ func loadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 
-	var config Config
+	config := Config{
+		WorkerCount:   5,
+		WorkQueueSize: 100,
+	}
 	if err := yaml.Unmarshal(data, &config); err != nil {
 		return nil, err
 	}
@@ -36,18 +57,49 @@ func loadConfig(path string) (*Config, error) {
 	return &config, nil
 }
 
-func updateRepo(repoPath string, repo *github.Repository) error {
-	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
-		log.Printf("Cloning %s...", *repo.Name)
-		_, err := git.PlainClone(repoPath, false, &git.CloneOptions{
-			URL: *repo.CloneURL,
+func newWorker(id int, client *github.Client, tasksChan chan RepoTask, wg *sync.WaitGroup) *Worker {
+	return &Worker{
+		id:          id,
+		client:      client,
+		tasksChan:   tasksChan,
+		wg:          wg,
+		rateLimiter: time.NewTicker(time.Second / 10),
+	}
+}
+
+func (w *Worker) start(ctx context.Context) {
+	go func() {
+		for {
+			select {
+			case task, ok := <-w.tasksChan:
+				if !ok {
+					return
+				}
+				<-w.rateLimiter.C
+				if err := w.processRepo(task); err != nil {
+					log.Printf("Worker %d: Error processing repository %s: %v",
+						w.id, *task.Repo.Name, err)
+				}
+				w.wg.Done()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+func (w *Worker) processRepo(task RepoTask) error {
+	if _, err := os.Stat(task.RepoPath); os.IsNotExist(err) {
+		log.Printf("Worker %d: Cloning %s...", w.id, *task.Repo.Name)
+		_, err := git.PlainClone(task.RepoPath, false, &git.CloneOptions{
+			URL: *task.Repo.CloneURL,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to clone repository: %v", err)
 		}
 	} else {
-		log.Printf("Pulling updates for %s...", *repo.Name)
-		r, err := git.PlainOpen(repoPath)
+		log.Printf("Worker %d: Pulling updates for %s...", w.id, *task.Repo.Name)
+		r, err := git.PlainOpen(task.RepoPath)
 		if err != nil {
 			return fmt.Errorf("failed to open repository: %v", err)
 		}
@@ -59,16 +111,15 @@ func updateRepo(repoPath string, repo *github.Repository) error {
 
 		err = w.Pull(&git.PullOptions{})
 		if err == git.NoErrAlreadyUpToDate {
-			log.Printf("Repository %s is already up to date", *repo.Name)
-		} else if err != nil {
+			log.Printf("Repository %s is already up to date", *task.Repo.Name)
+		} else if err != nil && err != git.ErrNonFastForwardUpdate {
 			return fmt.Errorf("failed to pull repository: %v", err)
 		}
 	}
 	return nil
 }
 
-func syncRepos(config *Config) error {
-	ctx := context.Background()
+func syncRepos(ctx context.Context, config *Config) error {
 	ts := oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: config.GithubToken},
 	)
@@ -79,18 +130,40 @@ func syncRepos(config *Config) error {
 		return fmt.Errorf("failed to create repos directory: %v", err)
 	}
 
-	repos, _, err := client.Repositories.List(ctx, config.GithubUser, nil)
-	if err != nil {
-		return fmt.Errorf("failed to get repositories list: %v", err)
+	tasksChan := make(chan RepoTask, config.WorkQueueSize)
+	var wg sync.WaitGroup
+
+	for i := 0; i < config.WorkerCount; i++ {
+		worker := newWorker(i, client, tasksChan, &wg)
+		worker.start(ctx)
 	}
 
-	for _, repo := range repos {
-		repoPath := filepath.Join(config.ReposDir, *repo.Name)
-		if err := updateRepo(repoPath, repo); err != nil {
-			log.Printf("Error processing repository %s: %v", *repo.Name, err)
+	opt := &github.RepositoryListOptions{
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+
+	for {
+		repos, resp, err := client.Repositories.List(ctx, config.GithubUser, opt)
+		if err != nil {
+			return fmt.Errorf("failed to get repositories list: %v", err)
 		}
+
+		for _, repo := range repos {
+			repoPath := filepath.Join(config.ReposDir, *repo.Name)
+			wg.Add(1)
+			tasksChan <- RepoTask{
+				Repo:     repo,
+				RepoPath: repoPath,
+			}
+		}
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
 	}
 
+	wg.Wait()
 	return nil
 }
 
@@ -110,12 +183,44 @@ func main() {
 
 	log.Printf("Starting repository sync service...")
 	log.Printf("Repositories will be stored in: %s", config.ReposDir)
+	log.Printf("Using %d workers with queue size %d", config.WorkerCount, config.WorkQueueSize)
 	log.Printf("Polling interval: %s", interval)
 
-	for {
-		if err := syncRepos(config); err != nil {
-			log.Printf("Error during sync: %v", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	errorChan := make(chan error, 1)
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				if err := syncRepos(ctx, config); err != nil {
+					errorChan <- err
+					return
+				}
+				time.Sleep(interval)
+			}
 		}
-		time.Sleep(interval)
+	}()
+
+	select {
+	case <-sigChan:
+		log.Println("Received shutdown signal. Finishing current tasks...")
+		cancel()
+	case err := <-errorChan:
+		log.Printf("Error during sync: %v", err)
+		cancel()
 	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	<-shutdownCtx.Done()
+	log.Println("Service stopped")
 }
