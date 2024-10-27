@@ -144,7 +144,7 @@ func syncRepos(ctx context.Context, config *Config) error {
 	}
 
 	for {
-		repos, resp, err := client.Repositories.List(ctx, config.GithubUser, opt)
+		repos, resp, err := client.Repositories.List(ctx, "", opt)
 		if err != nil {
 			return fmt.Errorf("failed to get repositories list: %v", err)
 		}
@@ -206,6 +206,7 @@ func main() {
 					errorChan <- err
 					return
 				}
+				log.Println("Syncing repos finished")
 				time.Sleep(interval)
 			}
 		}
