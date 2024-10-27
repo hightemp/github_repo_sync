@@ -131,6 +131,7 @@ func syncRepos(ctx context.Context, config *Config) error {
 	}
 
 	tasksChan := make(chan RepoTask, config.WorkQueueSize)
+	defer close(tasksChan)
 	var wg sync.WaitGroup
 
 	for i := 0; i < config.WorkerCount; i++ {
@@ -193,6 +194,7 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	errorChan := make(chan error, 1)
+	defer close(errorChan)
 
 	go func() {
 		for {
@@ -218,9 +220,5 @@ func main() {
 		cancel()
 	}
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
-
-	<-shutdownCtx.Done()
 	log.Println("Service stopped")
 }
