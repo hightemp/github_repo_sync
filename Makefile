@@ -18,7 +18,10 @@ service_install:
 
 service_restart:
 	sudo systemctl daemon-reload
-	sudo systemctl restart
+	sudo systemctl restart $(PROJECT_NAME)
 
 service_logs:
 	sudo journalctl -u $(PROJECT_NAME)
+
+service_stop:
+	sudo systemctl stop $(PROJECT_NAME)
