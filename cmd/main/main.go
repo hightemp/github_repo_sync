@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/google/go-github/v45/github"
 	"golang.org/x/oauth2"
 	"gopkg.in/yaml.v2"
@@ -37,6 +38,7 @@ type Worker struct {
 	client      *github.Client
 	tasksChan   chan RepoTask
 	wg          *sync.WaitGroup
+	config      *Config
 	rateLimiter *time.Ticker
 }
 
@@ -57,12 +59,13 @@ func loadConfig(path string) (*Config, error) {
 	return &config, nil
 }
 
-func newWorker(id int, client *github.Client, tasksChan chan RepoTask, wg *sync.WaitGroup) *Worker {
+func newWorker(id int, client *github.Client, tasksChan chan RepoTask, wg *sync.WaitGroup, config *Config) *Worker {
 	return &Worker{
 		id:          id,
 		client:      client,
 		tasksChan:   tasksChan,
 		wg:          wg,
+		config:      config,
 		rateLimiter: time.NewTicker(time.Second / 10),
 	}
 }
@@ -89,10 +92,16 @@ func (w *Worker) start(ctx context.Context) {
 }
 
 func (w *Worker) processRepo(task RepoTask) error {
+	auth := &http.BasicAuth{
+		Username: "git",
+		Password: w.config.GithubToken,
+	}
+
 	if _, err := os.Stat(task.RepoPath); os.IsNotExist(err) {
 		log.Printf("Worker %d: Cloning %s...", w.id, *task.Repo.Name)
 		_, err := git.PlainClone(task.RepoPath, false, &git.CloneOptions{
-			URL: *task.Repo.CloneURL,
+			URL:  *task.Repo.CloneURL,
+			Auth: auth,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to clone repository: %v", err)
@@ -109,7 +118,9 @@ func (w *Worker) processRepo(task RepoTask) error {
 			return fmt.Errorf("failed to get worktree: %v", err)
 		}
 
-		err = w.Pull(&git.PullOptions{})
+		err = w.Pull(&git.PullOptions{
+			Auth: auth,
+		})
 		if err == git.NoErrAlreadyUpToDate {
 			log.Printf("Repository %s is already up to date", *task.Repo.Name)
 		} else if err != nil && err != git.ErrNonFastForwardUpdate {
@@ -135,19 +146,24 @@ func syncRepos(ctx context.Context, config *Config) error {
 	var wg sync.WaitGroup
 
 	for i := 0; i < config.WorkerCount; i++ {
-		worker := newWorker(i, client, tasksChan, &wg)
+		worker := newWorker(i, client, tasksChan, &wg, config)
 		worker.start(ctx)
 	}
 
 	opt := &github.RepositoryListOptions{
+		Visibility:  "all",
 		ListOptions: github.ListOptions{PerPage: 100},
 	}
+
+	totalReposCnt := 0
 
 	for {
 		repos, resp, err := client.Repositories.List(ctx, "", opt)
 		if err != nil {
 			return fmt.Errorf("failed to get repositories list: %v", err)
 		}
+
+		totalReposCnt += len(repos)
 
 		for _, repo := range repos {
 			repoPath := filepath.Join(config.ReposDir, *repo.Name)
@@ -159,6 +175,7 @@ func syncRepos(ctx context.Context, config *Config) error {
 		}
 
 		if resp.NextPage == 0 {
+			fmt.Printf("[!] Found %d repositories\n", totalReposCnt)
 			break
 		}
 		opt.Page = resp.NextPage

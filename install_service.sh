@@ -73,8 +73,10 @@ chown -R "${USER}:${GROUP}" "/var/log/${APP_NAME}"
 chmod 755 "/var/log/${APP_NAME}"
 
 # Перезагружаем systemd и включаем сервис
+systemctl stop "${APP_NAME}.service"
 systemctl daemon-reload
 systemctl enable "${APP_NAME}.service"
+systemctl start "${APP_NAME}.service"
 
 echo "Installation completed!"
 echo "To start the service run: systemctl start ${APP_NAME}"
